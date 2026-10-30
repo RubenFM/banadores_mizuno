@@ -16,12 +16,13 @@ Uso:
     python3 buscar.py --corte todos --todos-modelos
     python3 buscar.py --query "GXソニック6" --incluir-vendidos
 """
-import argparse, base64, json, re, sys, time, uuid, urllib.request, urllib.error
+import argparse, base64, json, os, re, sys, time, uuid, urllib.request, urllib.error
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 from cryptography.hazmat.primitives import hashes
 
 API = "https://api.mercari.jp/v2/entities:search"
+FALLOS = []   # busquedas que fallaron (si fallan todas, salimos con error)
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 
@@ -128,9 +129,11 @@ def buscar(keyword, page_size=120, incluir_vendidos=False, precio_max=0):
             return json.load(r).get("items", [])
     except urllib.error.HTTPError as e:
         print(f"  ! HTTP {e.code} en '{keyword}'", file=sys.stderr)
+        FALLOS.append(keyword)
         return []
     except Exception as e:
         print(f"  ! {type(e).__name__} en '{keyword}': {e}", file=sys.stderr)
+        FALLOS.append(keyword)
         return []
 
 
@@ -183,6 +186,9 @@ def main():
     p.add_argument("--todos-modelos", action="store_true",
                    help="cualquier articulo, no solo GX-SONIC 6/ROYAL o anteriores nuevos")
     p.add_argument("--sin-filtro-ruido", action="store_true")
+    p.add_argument("--historico", metavar="JSON",
+                   help="mostrar solo articulos no vistos antes y anadirlos a este fichero")
+    p.add_argument("--markdown", metavar="MD", help="escribir los resultados en markdown (para la issue)")
     args = p.parse_args()
     tallas = [] if args.talla and "todas" in args.talla else (args.talla or DEF_TALLAS)
 
@@ -221,19 +227,51 @@ def main():
                 "talla": talla, "modelo": modelo, "corte": corte,
                 "codigo": detectar_codigo(nombre), "nuevo": nuevo,
                 "vendido": it.get("status") == "ITEM_STATUS_SOLD_OUT",
-                "mercari": f"https://jp.mercari.com/item/{iid}",
+                # Los ids de Mercari Shops no empiezan por "m" y tienen otra URL
+                "mercari": (f"https://jp.mercari.com/item/{iid}" if iid.startswith("m")
+                            else f"https://jp.mercari.com/shops/product/{iid}"),
                 "buyee": f"https://buyee.jp/mercari/item/{iid}"})
         time.sleep(1.0)   # cortesia con la API
 
+    if len(FALLOS) == len(queries):
+        sys.exit("todas las busquedas fallaron (¿Mercari bloquea esta IP?)")
     resultados.sort(key=lambda r: r["precio"])
+
+    if args.historico:
+        try:
+            with open(args.historico, encoding="utf-8") as f:
+                historico = json.load(f)
+        except FileNotFoundError:
+            historico = {}
+        resultados = [r for r in resultados if r["id"] not in historico]
+        for r in resultados:
+            historico[r["id"]] = {"precio": r["precio"], "nombre": r["nombre"],
+                                  "visto": time.strftime("%Y-%m-%d")}
+        with open(args.historico, "w", encoding="utf-8") as f:
+            json.dump(historico, f, ensure_ascii=False, indent=1)
+
     if not resultados:
-        print("\nSin resultados. Prueba --sin-filtro-ruido o anade --query.")
+        print("\nSin resultados nuevos." if args.historico else
+              "\nSin resultados. Prueba --sin-filtro-ruido o anade --query.")
         return
 
-    with open("/home/ruben/banadores/resultados.json", "w", encoding="utf-8") as f:
+    salida = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resultados.json")
+    with open(salida, "w", encoding="utf-8") as f:
         json.dump(resultados, f, ensure_ascii=False, indent=2)
 
-    print(f"\n{len(resultados)} articulos -> /home/ruben/banadores/resultados.json\n")
+    if args.markdown:
+        with open(args.markdown, "w", encoding="utf-8") as f:
+            f.write("| Precio | Modelo | Talla | Corte | Estado | Anuncio |\n|---|---|---|---|---|---|\n")
+            for r in resultados:
+                f.write(f"| ¥{r['precio']:,} (~{r['precio'] / EUR_JPY:.0f} €) | {r['modelo']} "
+                        f"| {r['talla']} | {r['corte']} | {'nuevo' if r['nuevo'] else 'usado'} "
+                        f"| [Buyee]({r['buyee']}) · [Mercari]({r['mercari']}) |\n")
+            f.write("\n<details><summary>Títulos originales</summary>\n\n")
+            for r in resultados:
+                f.write(f"- {r['nombre']}\n")
+            f.write("\n</details>\n")
+
+    print(f"\n{len(resultados)} articulos -> {salida}\n")
     for r in resultados:
         eur = r["precio"] / EUR_JPY      # aprox. JPY -> EUR, solo orientativo
         marca = (" [NUEVO]" if r["nuevo"] else "") + (" [VENDIDO]" if r["vendido"] else "")
